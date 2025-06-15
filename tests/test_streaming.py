@@ -37,69 +37,104 @@ class MockTensor:
 @pytest.fixture
 def mock_engine_instance():
     engine = MagicMock()
-    # engine.synthesize should be an AsyncMock if called with await,
-    # but it's run in an executor, so MagicMock is fine.
-    # It needs to return a tuple: (audio_tensor, sample_rate)
-    engine.synthesize = MagicMock(return_value=(MockTensor([0.1, 0.2, -0.1]), 24000))
+    # engine.generate is called in an executor, so MagicMock is fine.
+    # It needs to return only the audio_tensor.
+    engine.generate = MagicMock(return_value=MockTensor([0.1, 0.2, -0.1]))
+    engine.sr = 24000 # Add sample rate attribute
     return engine
 
 @pytest.mark.asyncio
 async def test_generate_single_chunk_audio_success(mock_engine_instance):
     text = "This is a test chunk."
     voice_params = {"voice_mode": "predefined", "predefined_voice_path": "dummy.wav"}
-    generation_params = {"temperature": 0.7, "seed": 123}
+    # Test with a seed
+    generation_params_with_seed = {"temperature": 0.7, "seed": 123, "exaggeration": 0.6, "cfg_weight": 0.4}
     output_format = "wav"
     target_output_sample_rate = 24000
 
-    # Mock utils.encode_audio
-    with patch("utils.encode_audio", return_value=b"encoded_audio_bytes") as mock_encode_audio:
+    # Patch the aliased engine_set_seed in the utils module
+    with patch("utils.engine_set_seed") as mock_set_seed, \
+         patch("utils.encode_audio", return_value=b"encoded_audio_bytes") as mock_encode_audio:
+
         audio_bytes = await generate_single_chunk_audio(
-            text, mock_engine_instance, voice_params, generation_params, output_format, target_output_sample_rate
+            text, mock_engine_instance, voice_params, generation_params_with_seed, output_format, target_output_sample_rate
         )
 
         assert audio_bytes == b"encoded_audio_bytes"
-        mock_engine_instance.synthesize.assert_called_once_with(
+        mock_set_seed.assert_called_once_with(123) # Verify seed was set
+        mock_engine_instance.generate.assert_called_once_with(
             text,
-            "dummy.wav", # audio_prompt_path_str from voice_params
-            0.7, # temperature from generation_params
-            0.5, # default exaggeration from generate_single_chunk_audio
-            0.5, # default cfg_weight from generate_single_chunk_audio
-            123  # seed from generation_params
+            "dummy.wav", # audio_prompt_path_str
+            0.7,         # temperature
+            0.6,         # exaggeration
+            0.4          # cfg_weight
         )
         mock_encode_audio.assert_called_once()
-        # More detailed assertions can be added for encode_audio arguments if needed
-        args, kwargs = mock_encode_audio.call_args
-        assert kwargs['output_format'] == output_format
-        assert kwargs['target_sample_rate'] == target_output_sample_rate
+        # You can add more detailed assertions for encode_audio arguments if needed:
+        # args, kwargs = mock_encode_audio.call_args
+        # assert kwargs['sample_rate'] == mock_engine_instance.sr # sample_rate from engine
+        # assert kwargs['target_sample_rate'] == target_output_sample_rate
+
+    # Test without a seed (seed=0 or not provided)
+    mock_engine_instance.generate.reset_mock() # Reset call count for generate
+    mock_set_seed.reset_mock() # This was an external mock, reset it if you need to check its calls again for this new case
+    mock_encode_audio.reset_mock() # This was an external mock, reset it
+    generation_params_no_seed = {"temperature": 0.7, "seed": 0} # seed = 0
+
+    with patch("utils.engine_set_seed") as mock_set_seed_no_seed, \
+         patch("utils.encode_audio", return_value=b"encoded_audio_bytes_no_seed") as mock_encode_audio_no_seed:
+
+        audio_bytes_no_seed = await generate_single_chunk_audio(
+            text, mock_engine_instance, voice_params, generation_params_no_seed, output_format, target_output_sample_rate
+        )
+        assert audio_bytes_no_seed == b"encoded_audio_bytes_no_seed"
+        mock_set_seed_no_seed.assert_not_called() # Verify set_seed was NOT called for seed=0
+        mock_engine_instance.generate.assert_called_once_with(
+            text,
+            "dummy.wav",
+            0.7, # temperature
+            0.5, # default exaggeration if not in params
+            0.5  # default cfg_weight if not in params
+        )
+        mock_encode_audio_no_seed.assert_called_once()
 
 
 @pytest.mark.asyncio
 async def test_generate_single_chunk_audio_engine_failure(mock_engine_instance):
-    mock_engine_instance.synthesize.return_value = (None, None) # Simulate engine failure
+    # Simulate engine's generate method raising an exception
+    mock_engine_instance.generate.side_effect = Exception("Simulated engine failure")
     text = "Test failure."
     voice_params = {}
-    generation_params = {}
+    generation_params = {} # No seed, so set_seed won't be called
     output_format = "wav"
     target_output_sample_rate = 24000
 
-    audio_bytes = await generate_single_chunk_audio(
-        text, mock_engine_instance, voice_params, generation_params, output_format, target_output_sample_rate
-    )
-    assert audio_bytes == b""
+    # Patching engine_set_seed because it would be called if seed was non-zero
+    with patch("utils.engine_set_seed") as mock_set_seed:
+        audio_bytes = await generate_single_chunk_audio(
+            text, mock_engine_instance, voice_params, generation_params, output_format, target_output_sample_rate
+        )
+        assert audio_bytes == b"" # Expect empty bytes on failure
+        mock_set_seed.assert_not_called() # Seed is 0 or not provided
+        mock_engine_instance.generate.assert_called_once() # generate was called
 
 @pytest.mark.asyncio
 async def test_generate_single_chunk_audio_encoder_failure(mock_engine_instance):
     text = "Test encoder failure."
     voice_params = {}
-    generation_params = {}
+    generation_params = {} # No seed
     output_format = "wav"
     target_output_sample_rate = 24000
 
-    with patch("utils.encode_audio", return_value=None) as mock_encode_audio: # Simulate encoder failure
+    with patch("utils.engine_set_seed") as mock_set_seed, \
+         patch("utils.encode_audio", return_value=None) as mock_encode_audio: # Simulate encoder failure
+
         audio_bytes = await generate_single_chunk_audio(
             text, mock_engine_instance, voice_params, generation_params, output_format, target_output_sample_rate
         )
         assert audio_bytes == b""
+        mock_set_seed.assert_not_called()
+        mock_engine_instance.generate.assert_called_once() # generate was called
         mock_encode_audio.assert_called_once()
 
 

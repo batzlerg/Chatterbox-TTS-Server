@@ -23,6 +23,7 @@ import torch
 # Assumes config.py and its config_manager are in the same directory or accessible via PYTHONPATH.
 from config import get_predefined_voices_path, get_reference_audio_path, config_manager
 from models import ChunkMetadata # Add this with other model imports if any, or create a section for it.
+from engine import set_seed as engine_set_seed # Use an alias to avoid potential naming conflicts
 
 # Optional import for librosa (for audio resampling, e.g., Opus encoding and time stretching)
 try:
@@ -845,58 +846,71 @@ async def generate_single_chunk_audio(
     voice_params: dict,
     generation_params: dict,
     output_format: str,
-    target_output_sample_rate: int # The desired sample rate for the final output audio
+    target_output_sample_rate: int
 ) -> bytes:
     """
     Generate audio for a single text chunk.
     """
-    # Extract voice parameters
-    voice_mode = voice_params.get("voice_mode", "predefined")
-
     audio_prompt_path_str = None
-    if voice_mode == "predefined":
+    if voice_params.get("voice_mode", "predefined") == "predefined":
         audio_prompt_path_str = voice_params.get("predefined_voice_path")
     else:  # clone mode
         audio_prompt_path_str = voice_params.get("reference_audio_path")
 
-    # Generate audio using the engine's synthesize method
-    # engine_instance.synthesize returns a tuple (audio_tensor, sample_rate_from_engine)
-    audio_tensor, sr_from_engine = await asyncio.get_event_loop().run_in_executor(
-        None,
-        engine_instance.synthesize, # Use the passed engine_instance
-        text,
-        audio_prompt_path_str,
-        generation_params.get("temperature", 0.8),
-        generation_params.get("exaggeration", 0.5),
-        generation_params.get("cfg_weight", 0.5),
-        generation_params.get("seed", 0)
-    )
+    current_seed = generation_params.get("seed", 0)
+    if current_seed != 0:
+        logger.info(f"Applying user-provided seed for chunk generation: {current_seed}")
+        engine_set_seed(current_seed) # Call the imported set_seed function
+    else:
+        logger.info(
+            "Using default (potentially random) generation behavior for chunk as seed is 0."
+        )
 
-    if audio_tensor is None or sr_from_engine is None:
-        logger.error(f"TTS engine failed to synthesize audio for chunk: '{text[:50]}...'")
-        return b"" # Return empty bytes if generation failed
+    # Get generation parameters, providing defaults if not specified
+    temperature = generation_params.get("temperature", 0.8)
+    exaggeration = generation_params.get("exaggeration", 0.5) # Default from original implementation attempt
+    cfg_weight = generation_params.get("cfg_weight", 0.5)     # Default from original implementation attempt
 
-    # Ensure audio_tensor is on CPU and convert to NumPy array
+    try:
+        # engine_instance.generate returns only the audio_tensor
+        # Sample rate is an attribute of the engine_instance: engine_instance.sr
+        audio_tensor = await asyncio.get_event_loop().run_in_executor(
+            None,
+            engine_instance.generate, # CORRECTED: Call the 'generate' method
+            text,
+            audio_prompt_path_str,
+            temperature,
+            exaggeration,
+            cfg_weight
+            # Seed is NOT passed directly to 'generate'
+        )
+        sr_from_engine = engine_instance.sr # CORRECTED: Get sample rate as an attribute
+
+    except Exception as e:
+        logger.error(f"Call to engine_instance.generate failed for chunk '{text[:50]}...': {e}", exc_info=True)
+        return b""
+
+
+    if audio_tensor is None or sr_from_engine is None: # sr_from_engine check might be redundant if engine_instance always has .sr
+        logger.error(f"TTS engine failed to synthesize audio or get sample rate for chunk: '{text[:50]}...'")
+        return b""
+
     audio_np = audio_tensor.cpu().numpy()
 
-    # Ensure audio is mono. Squeeze if it's (1, samples) or (samples, 1).
     if audio_np.ndim == 2:
         if audio_np.shape[0] == 1:
             audio_np = audio_np.squeeze(0)
         elif audio_np.shape[1] == 1:
             audio_np = audio_np.squeeze(1)
-        else: # True stereo or multi-channel
+        else:
             logger.warning(f"Multi-channel audio tensor (shape: {audio_np.shape}) received for chunk. Using only the first channel.")
             audio_np = audio_np[:, 0]
 
-    # Convert to audio bytes in requested format using existing encode_audio
-    # encode_audio takes the raw audio_np with its original sample_rate (sr_from_engine)
-    # and can resample it to target_output_sample_rate if they differ.
     audio_bytes = encode_audio(
         audio_array=audio_np,
-        sample_rate=sr_from_engine, # This is the sample rate of audio_np
+        sample_rate=sr_from_engine,
         output_format=output_format,
-        target_sample_rate=target_output_sample_rate # This is the desired output sample rate for the stream
+        target_sample_rate=target_output_sample_rate
     )
 
     if audio_bytes is None:
