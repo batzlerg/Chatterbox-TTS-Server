@@ -11,11 +11,12 @@ import shutil
 import time
 import uuid
 import yaml  # For loading presets
+import asyncio # Should be near other standard library imports
 import numpy as np
 import librosa  # For potential direct use if needed, though utils.py handles most
 from pathlib import Path
 from contextlib import asynccontextmanager
-from typing import Optional, List, Dict, Any, Literal
+from typing import Optional, List, Dict, Any, Literal # Ensure List, Dict, Any are imported, if not already
 import webbrowser  # For automatic browser opening
 import threading  # For automatic browser opening
 
@@ -64,8 +65,12 @@ from models import (  # Pydantic models
     CustomTTSRequest,
     ErrorResponse,
     UpdateStatusResponse,
+    StreamingTTSRequest, # Add StreamingTTSRequest
+    ChunkMetadata # Add ChunkMetadata
 )
 import utils  # Utility functions
+from utils import generate_streaming_audio_chunks, chunk_text_by_sentences # Import new util
+from config import config_manager, get_audio_sample_rate # Import config_manager and get_audio_sample_rate
 
 from pydantic import BaseModel, Field
 
@@ -597,6 +602,94 @@ async def upload_predefined_voice_endpoint(files: List[UploadFile] = File(...)):
     return JSONResponse(content=response_data, status_code=status_code)
 
 
+# --- TTS Generation Helper Functions ---
+async def prepare_voice_parameters(request: StreamingTTSRequest) -> dict:
+    """
+    Prepare voice parameters from request, similar to existing logic in /tts endpoint.
+    Uses config_manager for paths.
+    """
+    voice_params = {"voice_mode": request.voice_mode}
+
+    if request.voice_mode == "predefined":
+        if not request.predefined_voice_id:
+            # Use default from config if not provided in request
+            request.predefined_voice_id = config_manager.get_string("tts_engine.default_voice_id")
+
+        predefined_voices_path = config_manager.get_path("tts_engine.predefined_voices_path", ensure_absolute=True)
+        voice_file_path = predefined_voices_path / request.predefined_voice_id
+
+        if not voice_file_path.is_file(): # Changed from exists() to is_file() for robustness
+            logger.error(f"Predefined voice file not found: {voice_file_path}")
+            raise HTTPException(status_code=404, detail=f"Predefined voice not found: {request.predefined_voice_id}")
+
+        voice_params["predefined_voice_path"] = str(voice_file_path)
+
+    else:  # clone mode
+        if not request.reference_audio_filename:
+            logger.error("Reference audio filename required for clone mode but not provided.")
+            raise HTTPException(status_code=400, detail="reference_audio_filename required for clone mode")
+
+        reference_audio_dir_path = config_manager.get_path("tts_engine.reference_audio_path", ensure_absolute=True)
+        ref_file_path = reference_audio_dir_path / request.reference_audio_filename
+
+        if not ref_file_path.is_file(): # Changed from exists() to is_file()
+            logger.error(f"Reference audio file not found: {ref_file_path}")
+            raise HTTPException(status_code=404, detail=f"Reference audio not found: {request.reference_audio_filename}")
+
+        # Add validation for clone reference audio if necessary (e.g., utils.validate_reference_audio)
+        max_dur = config_manager.get_int("audio_output.max_reference_duration_sec", 30)
+        is_valid, msg = utils.validate_reference_audio(ref_file_path, max_dur)
+        if not is_valid:
+            logger.error(f"Invalid reference audio for streaming: {msg}")
+            raise HTTPException(status_code=400, detail=f"Invalid reference audio: {msg}")
+
+        voice_params["reference_audio_path"] = str(ref_file_path)
+
+    return voice_params
+
+def prepare_generation_parameters(request: StreamingTTSRequest) -> dict:
+    """
+    Prepare generation parameters with defaults from config.
+    """
+    return {
+        "temperature": request.temperature if request.temperature is not None else config_manager.get_float("generation_defaults.temperature"),
+        "exaggeration": request.exaggeration if request.exaggeration is not None else config_manager.get_float("generation_defaults.exaggeration"),
+        "cfg_weight": request.cfg_weight if request.cfg_weight is not None else config_manager.get_float("generation_defaults.cfg_weight"),
+        "seed": request.seed if request.seed is not None else config_manager.get_int("generation_defaults.seed"),
+        "speed_factor": request.speed_factor if request.speed_factor is not None else config_manager.get_float("generation_defaults.speed_factor"),
+        "language": request.language if request.language is not None else config_manager.get_string("generation_defaults.language")
+    }
+
+async def stream_audio_chunks_generator(
+    text_chunks: List[str],
+    engine_instance, # This will be engine.chatterbox_model
+    voice_params: dict,
+    generation_params: dict,
+    output_format: str,
+    target_output_sample_rate: int
+):
+    """
+    Generator function for streaming audio chunks.
+    """
+    try:
+        # Generate and yield chunks in real-time
+        async for audio_bytes, metadata in generate_streaming_audio_chunks(
+            text_chunks, engine_instance, voice_params, generation_params, output_format, target_output_sample_rate
+        ):
+            # The problem description mentions adding chunk separator or metadata headers if needed.
+            # For now, just yielding audio_bytes. If metadata needs to be streamed alongside,
+            # the response structure (e.g. multipart/x-mixed-replace or custom format) would need to change.
+            # The current plan implies separate metadata in headers or a final summary, not per chunk in the audio stream body.
+            yield audio_bytes
+
+            # Optional: Add small delay to prevent overwhelming client (as in issue)
+            await asyncio.sleep(0.01)
+
+    except Exception as e:
+        logger.error(f"Error in streaming generator: {e}", exc_info=True)
+        # This exception will propagate to the endpoint handler and be caught there.
+        raise
+
 # --- TTS Generation Endpoint ---
 
 
@@ -897,6 +990,83 @@ async def custom_tts_endpoint(
         io.BytesIO(encoded_audio_bytes), media_type=media_type, headers=headers
     )
 
+@app.post("/tts/stream-chunks", tags=["TTS Generation"], summary="Generate speech in real-time audio chunks")
+async def stream_tts_chunks(request: StreamingTTSRequest):
+    """
+    Real-time streaming TTS endpoint that yields audio chunks as they're generated.
+    """
+    if not engine.MODEL_LOADED or engine.chatterbox_model is None:
+        logger.error("Streaming TTS request failed: Model not loaded.")
+        raise HTTPException(
+            status_code=503,
+            detail="TTS engine model is not currently loaded or available.",
+        )
+
+    try:
+        perf_monitor_stream = utils.PerformanceMonitor(
+            enabled=config_manager.get_bool("server.enable_performance_monitor", False)
+        )
+        perf_monitor_stream.record("Streaming TTS request received")
+
+        # Validate and prepare voice parameters
+        voice_params = await prepare_voice_parameters(request) # Made this async based on its new signature
+        perf_monitor_stream.record("Voice parameters prepared for streaming")
+
+        # Prepare generation parameters
+        generation_params = prepare_generation_parameters(request)
+        perf_monitor_stream.record("Generation parameters prepared for streaming")
+
+        # Get text chunks
+        # Use configured default chunk size if not provided in request, or fallback to a sensible default.
+        default_stream_chunk_size = config_manager.get_int("generation_defaults.streaming_chunk_size", 120)
+        chunk_size_to_use = request.chunk_size if request.chunk_size is not None else default_stream_chunk_size
+
+        if request.split_text and len(request.text) > chunk_size_to_use: # Compare with actual chunk_size_to_use
+            text_chunks = chunk_text_by_sentences(request.text, chunk_size_to_use)
+        else:
+            text_chunks = [request.text]
+
+        if not text_chunks:
+            raise HTTPException(status_code=400, detail="Text processing resulted in no usable chunks for streaming.")
+
+        perf_monitor_stream.record(f"Text split into {len(text_chunks)} chunks for streaming")
+
+        # Get target output sample rate from config
+        target_sr = get_audio_sample_rate() # Uses the global audio_output.sample_rate
+
+        # Return streaming response
+        # The actual engine instance (engine.chatterbox_model) is passed here
+        response_generator = stream_audio_chunks_generator(
+            text_chunks,
+            engine.chatterbox_model, # Pass the actual loaded model
+            voice_params,
+            generation_params,
+            request.output_format,
+            target_sr # Pass target sample rate
+        )
+
+        perf_monitor_stream.record("Streaming generator created")
+        # Report performance before starting the stream, as the stream itself might be long-running.
+        logger.debug(perf_monitor_stream.report())
+
+        return StreamingResponse(
+            response_generator,
+            media_type=f"audio/{request.output_format}", # opus, wav, mp3
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Total-Chunks": str(len(text_chunks)),
+                # Consider adding X-Chunk-Metadata if a way to signal metadata per chunk is decided.
+                # For now, client would rely on X-Total-Chunks and order of received chunks.
+            }
+        )
+
+    except HTTPException as http_exc:
+        logger.error(f"HTTPException in streaming TTS: {http_exc.detail}", exc_info=True)
+        raise # Re-raise HTTPException to let FastAPI handle it
+    except Exception as e:
+        logger.error(f"Unhandled error in streaming TTS endpoint: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error during streaming: {str(e)}")
 
 @app.post("/v1/audio/speech", tags=["OpenAI Compatible"])
 async def openai_speech_endpoint(request: OpenAISpeechRequest):

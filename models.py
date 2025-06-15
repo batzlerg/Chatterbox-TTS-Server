@@ -1,7 +1,7 @@
 # File: models.py
 # Pydantic models for API request and response validation.
 
-from typing import Optional, Literal
+from typing import Optional, Literal, List # Ensure List is imported
 from pydantic import BaseModel, Field
 
 
@@ -94,6 +94,28 @@ class CustomTTSRequest(BaseModel):
         None, description="Overrides default language if provided."
     )
 
+# Add after existing CustomTTSRequest class
+class StreamingTTSRequest(BaseModel):
+    text: str = Field(..., description="Text to synthesize")
+    voice_mode: Literal["predefined", "clone"] = Field(default="predefined")
+    predefined_voice_id: Optional[str] = Field(default=None)
+    reference_audio_filename: Optional[str] = Field(default=None)
+    output_format: Literal["wav", "opus", "mp3"] = Field(default="wav") # Added mp3 to align with CustomTTSRequest
+    split_text: bool = Field(default=True, description="Enable real-time chunk streaming")
+    chunk_size: int = Field(default=120, ge=50, le=500) # Default from CustomTTSRequest
+    temperature: Optional[float] = Field(default=None, ge=0.0, le=1.5)
+    exaggeration: Optional[float] = Field(default=None, ge=0.25, le=2.0) # Range from GenerationParams
+    cfg_weight: Optional[float] = Field(default=None, ge=0.2, le=1.0) # Range from GenerationParams
+    seed: Optional[int] = Field(default=None, ge=0) # ge from GenerationParams
+    speed_factor: Optional[float] = Field(default=None, ge=0.25, le=4.0) # Range from GenerationParams
+    language: Optional[str] = Field(default=None)
+    stream_mode: Literal["complete", "chunks"] = Field(default="chunks", description="Streaming behavior")
+
+class ChunkMetadata(BaseModel):
+    chunk_index: int
+    total_chunks: int
+    chunk_text: str
+    is_final: bool = False
 
 class ErrorResponse(BaseModel):
     """Standard error response model for API errors."""

@@ -5,12 +5,13 @@
 
 import os
 import logging
+import asyncio # Should be near other standard library imports
 import re
 import time
-import io
+import io # Should be near other standard library imports
 import uuid
 from pathlib import Path
-from typing import Optional, Tuple, Dict, Any, Set, List
+from typing import Optional, Tuple, Dict, Any, Set, List, AsyncGenerator # Ensure List, Tuple, AsyncGenerator, Optional are present
 from pydub import AudioSegment
 
 import numpy as np
@@ -21,6 +22,7 @@ import torch
 # Configuration manager to get paths dynamically.
 # Assumes config.py and its config_manager are in the same directory or accessible via PYTHONPATH.
 from config import get_predefined_voices_path, get_reference_audio_path, config_manager
+from models import ChunkMetadata # Add this with other model imports if any, or create a section for it.
 
 # Optional import for librosa (for audio resampling, e.g., Opus encoding and time stretching)
 try:
@@ -837,6 +839,122 @@ def remove_long_unvoiced_segments(
         logger.error(f"Error during unvoiced segment removal: {e}", exc_info=True)
         return audio_array
 
+async def generate_single_chunk_audio(
+    text: str,
+    engine_instance, # Instance of the TTS engine (e.g., chatterbox_model from engine.py)
+    voice_params: dict,
+    generation_params: dict,
+    output_format: str,
+    target_output_sample_rate: int # The desired sample rate for the final output audio
+) -> bytes:
+    """
+    Generate audio for a single text chunk.
+    """
+    # Extract voice parameters
+    voice_mode = voice_params.get("voice_mode", "predefined")
+
+    audio_prompt_path_str = None
+    if voice_mode == "predefined":
+        audio_prompt_path_str = voice_params.get("predefined_voice_path")
+    else:  # clone mode
+        audio_prompt_path_str = voice_params.get("reference_audio_path")
+
+    # Generate audio using the engine's synthesize method
+    # engine_instance.synthesize returns a tuple (audio_tensor, sample_rate_from_engine)
+    audio_tensor, sr_from_engine = await asyncio.get_event_loop().run_in_executor(
+        None,
+        engine_instance.synthesize, # Use the passed engine_instance
+        text,
+        audio_prompt_path_str,
+        generation_params.get("temperature", 0.8),
+        generation_params.get("exaggeration", 0.5),
+        generation_params.get("cfg_weight", 0.5),
+        generation_params.get("seed", 0)
+    )
+
+    if audio_tensor is None or sr_from_engine is None:
+        logger.error(f"TTS engine failed to synthesize audio for chunk: '{text[:50]}...'")
+        return b"" # Return empty bytes if generation failed
+
+    # Ensure audio_tensor is on CPU and convert to NumPy array
+    audio_np = audio_tensor.cpu().numpy()
+
+    # Ensure audio is mono. Squeeze if it's (1, samples) or (samples, 1).
+    if audio_np.ndim == 2:
+        if audio_np.shape[0] == 1:
+            audio_np = audio_np.squeeze(0)
+        elif audio_np.shape[1] == 1:
+            audio_np = audio_np.squeeze(1)
+        else: # True stereo or multi-channel
+            logger.warning(f"Multi-channel audio tensor (shape: {audio_np.shape}) received for chunk. Using only the first channel.")
+            audio_np = audio_np[:, 0]
+
+    # Convert to audio bytes in requested format using existing encode_audio
+    # encode_audio takes the raw audio_np with its original sample_rate (sr_from_engine)
+    # and can resample it to target_output_sample_rate if they differ.
+    audio_bytes = encode_audio(
+        audio_array=audio_np,
+        sample_rate=sr_from_engine, # This is the sample rate of audio_np
+        output_format=output_format,
+        target_sample_rate=target_output_sample_rate # This is the desired output sample rate for the stream
+    )
+
+    if audio_bytes is None:
+        logger.error(f"Failed to encode audio for chunk: '{text[:50]}...'")
+        return b""
+
+    return audio_bytes
+
+async def generate_streaming_audio_chunks(
+    text_chunks: List[str],
+    engine_instance, # Instance of the TTS engine
+    voice_params: dict,
+    generation_params: dict,
+    output_format: str = "wav",
+    target_output_sample_rate: int = 24000 # Default based on typical config, pass from server
+) -> AsyncGenerator[Tuple[bytes, ChunkMetadata], None]:
+    """
+    Generate audio for each text chunk individually and yield immediately.
+
+    Args:
+        text_chunks: List of text chunks to process
+        engine_instance: TTS engine instance
+        voice_params: Voice configuration (mode, file paths, etc.)
+        generation_params: Generation parameters (temp, seed, etc.)
+        output_format: Audio format for output
+        target_output_sample_rate: The target sample rate for the output audio.
+
+    Yields:
+        Tuple of (audio_bytes, chunk_metadata)
+    """
+    total_chunks = len(text_chunks)
+
+    for i, chunk_text in enumerate(text_chunks):
+        try:
+            # Generate audio for this single chunk
+            audio_data = await generate_single_chunk_audio(
+                chunk_text, engine_instance, voice_params, generation_params, output_format, target_output_sample_rate
+            )
+
+            if not audio_data: # Skip if audio generation or encoding failed
+                logger.warning(f"Skipping chunk {i} ('{chunk_text[:50]}...') due to generation/encoding error.")
+                continue
+
+            # Create metadata for this chunk
+            metadata = ChunkMetadata(
+                chunk_index=i,
+                total_chunks=total_chunks,
+                chunk_text=chunk_text,
+                is_final=(i == total_chunks - 1)
+            )
+
+            yield audio_data, metadata
+
+        except Exception as e:
+            logger.error(f"Error generating stream for chunk {i} ('{chunk_text[:50]}...'): {e}", exc_info=True)
+            # Optionally, yield metadata with an error field or specific error chunk. For now, logs and continues.
+            # Example: yield (b"", ChunkMetadata(chunk_index=i, total_chunks=total_chunks, chunk_text=chunk_text, is_final=(i == total_chunks - 1), error_message=str(e)))
+            continue
 
 # --- Text Processing Utilities ---
 def _is_valid_sentence_end(text: str, period_index: int) -> bool:

@@ -25,6 +25,7 @@ generation_defaults:
   seed: 0
   speed_factor: 1.0
   language: en
+  streaming_chunk_size: 200 # Added
 audio_output:
   format: wav
   sample_rate: 24000
@@ -51,3 +52,9 @@ ui:
   max_predefined_voices_in_dropdown: 50
 debug:
   save_intermediate_audio: false
+
+# Add new streaming section:
+streaming:
+  enable_chunk_streaming: true
+  chunk_overlap_ms: 100     # Note: Not currently used by server logic
+  max_streaming_chunks: 20  # Note: Not currently used by server logic
